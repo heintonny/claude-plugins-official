@@ -47,7 +47,7 @@ const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
 if (!TOKEN) {
   process.stderr.write(
     `telegram channel: TELEGRAM_BOT_TOKEN required\n` +
-    `  configure via: /plugin reconfigure telegram\n` +
+    `  re-enter via: /plugin manage → telegram → Configure options\n` +
     `  (stored in keychain/credentials.json, not settings.json)\n`,
   )
   process.exit(1)

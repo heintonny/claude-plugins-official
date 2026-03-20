@@ -58,7 +58,7 @@ const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
 if (!TOKEN) {
   process.stderr.write(
     `discord channel: DISCORD_BOT_TOKEN required\n` +
-    `  configure via: /plugin reconfigure discord\n` +
+    `  re-enter via: /plugin manage → discord → Configure options\n` +
     `  (stored in keychain/credentials.json, not settings.json)\n`,
   )
   process.exit(1)
