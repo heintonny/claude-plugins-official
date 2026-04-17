@@ -21,6 +21,7 @@ import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
+import { execFileSync } from 'child_process'
 import { join, extname, sep } from 'path'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR
@@ -63,8 +64,15 @@ try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
     process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
+    // PID files race with OS PID recycling — verify the holder is actually a
+    // server.ts process before SIGTERM. Otherwise a recycled PID can point at
+    // our own bun-run wrapper (kills our stdin → immediate self-shutdown) or
+    // an unrelated user process.
+    const cmd = execFileSync('ps', ['-p', String(stale), '-o', 'args='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    if (cmd.includes('server.ts')) {
+      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+      process.kill(stale, 'SIGTERM')
+    }
   }
 } catch {}
 writeFileSync(PID_FILE, String(process.pid))
