@@ -23,6 +23,7 @@ import {
   Partials,
   ChannelType,
   ActivityType,
+  ApplicationCommandOptionType,
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
@@ -31,7 +32,7 @@ import {
   type Interaction,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
 
@@ -752,10 +753,222 @@ client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
 })
 
+// ────────────────────────────────────────────────────────────────────────────
+// Slash command registration — heintonny-fork addition.
+//
+// Discover user-invocable Claude skills on the local filesystem and register
+// them as Discord chat input (slash) commands so they show up in Discord's
+// `/` autocomplete. When a user picks one, we forward it as a regular
+// `/skill-name args` notification through the existing inbound pipeline.
+//
+// Sources scanned:
+//   - ~/.claude/skills/<name>/SKILL.md         (user skills)
+//   - ~/.claude/plugins/cache/<m>/<p>/<v>/skills/<name>/SKILL.md   (plugin skills)
+// ────────────────────────────────────────────────────────────────────────────
+
+interface SkillMeta {
+  name: string         // original name, may contain ':' (e.g. discord:access)
+  cmdName: string      // Discord-safe (^[a-z0-9_-]{1,32}$)
+  description: string  // truncated to 100 chars (Discord limit)
+}
+
+let registeredSkills: SkillMeta[] = []
+
+// Native Claude Code slash commands — built into the binary, not files on
+// disk, so cannot be auto-discovered. This is a curated list of commands
+// that are useful and safe to invoke from Discord. Excluded on purpose:
+//   /clear, /exit, /new — would break resume-continuity for the daemon
+//   /resume            — meaningless inside an already-resumed session
+//   /bash, /init       — too dangerous / dir-binding from a remote channel
+const NATIVE_COMMANDS: Array<{ name: string; description: string }> = [
+  { name: 'help',     description: 'Show available slash commands' },
+  { name: 'compact',  description: 'Summarize and compact the conversation context' },
+  { name: 'status',   description: 'Show session status (model, dir, tokens)' },
+  { name: 'cost',     description: 'Show token usage and cost for this session' },
+  { name: 'memory',   description: 'View or edit persistent memory' },
+  { name: 'agents',   description: 'List or manage background and configured agents' },
+  { name: 'plugin',   description: 'Manage Claude Code plugins' },
+  { name: 'mcp',      description: 'List or configure MCP servers' },
+  { name: 'model',    description: 'Show or switch the active model' },
+  { name: 'effort',   description: 'Set effort level (low, medium, high, xhigh, max)' },
+  { name: 'loop',     description: 'Start a self-pacing loop on a task' },
+  { name: 'schedule', description: 'Schedule a recurring agent task (cron)' },
+  { name: 'hooks',    description: 'Show or edit hooks config' },
+  { name: 'config',   description: 'Show or edit config' },
+]
+
+function parseSkillFrontmatter(file: string): { name?: string; description?: string; userInvocable?: boolean } | null {
+  let text: string
+  try { text = readFileSync(file, 'utf8') } catch { return null }
+  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)
+  if (!m) return null
+  const out: { name?: string; description?: string; userInvocable?: boolean } = {}
+  let key: 'name' | 'description' | 'userInvocable' | null = null
+  let buf = ''
+  const flush = () => {
+    if (!key) return
+    const v = buf.trim().replace(/^["']|["']$/g, '')
+    if (key === 'name') out.name = v
+    else if (key === 'description') out.description = v
+    else if (key === 'userInvocable') out.userInvocable = v === 'true'
+    key = null; buf = ''
+  }
+  for (const raw of m[1].split('\n')) {
+    const line = raw.replace(/\r$/, '')
+    const kv = /^([a-zA-Z][\w-]*):\s*(.*)$/.exec(line)
+    if (kv) {
+      flush()
+      const k = kv[1]
+      if (k === 'name') key = 'name'
+      else if (k === 'description') key = 'description'
+      else if (k === 'user-invocable') key = 'userInvocable'
+      else key = null
+      buf = kv[2]
+    } else if (key && /^\s+\S/.test(line)) {
+      buf += ' ' + line.trim()
+    }
+  }
+  flush()
+  return out
+}
+
+function discoverSkills(): SkillMeta[] {
+  const home = homedir()
+  const seen = new Set<string>()
+  const out: SkillMeta[] = []
+
+  // Native Claude Code commands first — they outrank any same-named skill
+  for (const nc of NATIVE_COMMANDS) {
+    const cmdName = nc.name.toLowerCase()
+    if (!/^[a-z0-9_-]{1,32}$/.test(cmdName)) continue
+    seen.add(nc.name)
+    out.push({ name: nc.name, cmdName, description: nc.description.slice(0, 100) })
+  }
+
+  const tryAddSkill = (skillDir: string, prefix?: string) => {
+    const skillFile = join(skillDir, 'SKILL.md')
+    if (!existsSync(skillFile)) return
+    const meta = parseSkillFrontmatter(skillFile)
+    if (!meta?.name || !meta?.description) return
+    if (meta.userInvocable === false) return
+    const fullName = prefix ? `${prefix}:${meta.name}` : meta.name
+    if (seen.has(fullName)) return
+    seen.add(fullName)
+    const cmdName = fullName.replace(/[:/]/g, '_').toLowerCase().slice(0, 32)
+    if (!/^[a-z0-9_-]{1,32}$/.test(cmdName)) return
+    out.push({ name: fullName, cmdName, description: meta.description.slice(0, 100) })
+  }
+
+  const scanSkillsRoot = (rootDir: string, prefix?: string) => {
+    if (!existsSync(rootDir)) return
+    let entries: string[]
+    try { entries = readdirSync(rootDir) } catch { return }
+    for (const ent of entries) {
+      try {
+        const sub = join(rootDir, ent)
+        if (statSync(sub).isDirectory()) tryAddSkill(sub, prefix)
+      } catch { /* skip */ }
+    }
+  }
+
+  scanSkillsRoot(join(home, '.claude', 'skills'))
+
+  const cacheDir = join(home, '.claude', 'plugins', 'cache')
+  if (existsSync(cacheDir)) {
+    let marketplaces: string[]
+    try { marketplaces = readdirSync(cacheDir) } catch { marketplaces = [] }
+    for (const marketplace of marketplaces) {
+      const mDir = join(cacheDir, marketplace)
+      let plugins: string[]
+      try { plugins = readdirSync(mDir) } catch { continue }
+      for (const plugin of plugins) {
+        const pDir = join(mDir, plugin)
+        let versions: string[]
+        try { versions = readdirSync(pDir) } catch { continue }
+        for (const ver of versions) {
+          const skillsDir = join(pDir, ver, 'skills')
+          if (existsSync(skillsDir)) scanSkillsRoot(skillsDir, plugin)
+        }
+      }
+    }
+  }
+
+  return out
+}
+
+async function registerSkillCommands(c: import('discord.js').Client<true>): Promise<void> {
+  registeredSkills = discoverSkills()
+  if (registeredSkills.length === 0) {
+    process.stderr.write('discord channel: no user-invocable skills discovered, slash registration skipped\n')
+    return
+  }
+  // Discord cap: 100 commands per scope. Trim if needed (extremely unlikely)
+  const slice = registeredSkills.slice(0, 100)
+  const commands = slice.map(s => ({
+    name: s.cmdName,
+    description: s.description.slice(0, 100) || s.cmdName,
+    options: [{
+      name: 'args',
+      description: 'Arguments (optional)',
+      type: ApplicationCommandOptionType.String,
+      required: false,
+    }],
+  }))
+  try {
+    const result = await c.application.commands.set(commands)
+    process.stderr.write(
+      `discord channel: registered ${result.size} slash commands ` +
+      `(${slice.map(s => '/' + s.cmdName).join(', ')})\n`,
+    )
+  } catch (err) {
+    process.stderr.write(`discord channel: slash command registration failed: ${err}\n`)
+  }
+}
+
 // Button-click handler for permission requests. customId is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 client.on('interactionCreate', async (interaction: Interaction) => {
+  // Slash command (chat input) — heintonny-fork addition
+  if (interaction.isChatInputCommand()) {
+    const skill = registeredSkills.find(s => s.cmdName === interaction.commandName)
+    if (!skill) {
+      await interaction.reply({ content: 'Unknown command.', ephemeral: true }).catch(() => {})
+      return
+    }
+    // Authorization mirrors messageCreate gating: sender must be in allowFrom
+    // (channel-scoped or global). Slash commands carry user identity, so we
+    // check the same way without going through gate() (no pairing flow needed).
+    const access = loadAccess()
+    const channelId = interaction.channelId ?? ''
+    const channelAllowed = (access.groups?.[channelId]?.allowFrom ?? []).includes(interaction.user.id)
+    const globalAllowed = (access.allowFrom ?? []).includes(interaction.user.id)
+    if (!channelAllowed && !globalAllowed) {
+      await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+      return
+    }
+    const args = interaction.options.getString('args') ?? ''
+    const command = `/${skill.name}${args ? ' ' + args : ''}`
+    await interaction.reply({ content: `Running \`${command}\`...` }).catch(() => {})
+    void mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: command,
+        meta: {
+          chat_id: channelId,
+          message_id: interaction.id,
+          user: interaction.user.username,
+          user_id: interaction.user.id,
+          ts: new Date().toISOString(),
+          via: 'slash_command',
+        },
+      },
+    }).catch(err => {
+      process.stderr.write(`discord channel: slash command delivery failed: ${err}\n`)
+    })
+    return
+  }
+
   if (!interaction.isButton()) return
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
   if (!m) return
@@ -913,6 +1126,7 @@ async function handleInbound(msg: Message): Promise<void> {
 
 client.once('ready', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+  void registerSkillCommands(c)
 })
 
 client.login(TOKEN).catch(err => {
