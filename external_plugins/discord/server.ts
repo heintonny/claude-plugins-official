@@ -947,6 +947,13 @@ client.on('interactionCreate', async (interaction: Interaction) => {
       await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
       return
     }
+    // Mirror messageCreate: cache DM channel→user mapping so outbound replies
+    // via fetchAllowedChannel can resolve the recipient. Without this, the
+    // first slash-command in a DM populates no cache, and any subsequent
+    // reply to that chat_id fails with "channel ... is not allowlisted".
+    if (interaction.channel?.type === ChannelType.DM) {
+      dmChannelUsers.set(channelId, interaction.user.id)
+    }
     const args = interaction.options.getString('args') ?? ''
     const command = `/${skill.name}${args ? ' ' + args : ''}`
     await interaction.reply({ content: `Running \`${command}\`...` }).catch(() => {})
