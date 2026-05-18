@@ -3,8 +3,8 @@
   "name": "claude-marketplace",
   "description": "Directory of popular Claude Code extensions including development tools, productivity plugins, and MCP integrations",
   "owner": {
-    "name": "Anthropic",
-    "email": "support@anthropic.com"
+    "name": "Hein Tonny Koien",
+    "email": "hein.tonny.koien@gmail.com"
   },
   "plugins": [
     {
