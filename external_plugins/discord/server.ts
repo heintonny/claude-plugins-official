@@ -753,6 +753,27 @@ client.on('error', err => {
   process.stderr.write(`discord channel: client error: ${err}\n`)
 })
 
+// Gateway-shard lifecycle observability — heintonny-fork addition.
+// Triggered by incidents/2026-05-19-ubuntu-tw-discord-gateway-zombie.md:
+// discord.js' zombie-detect destroyed the shard and resume failed, but
+// without these handlers the failure was silent. Stderr → systemd journal.
+client.on('shardError', (err, shardId) => {
+  process.stderr.write(`discord channel: shard ${shardId} error: ${err.message}\n`)
+})
+client.on('shardDisconnect', (event, shardId) => {
+  process.stderr.write(`discord channel: shard ${shardId} disconnect (code ${event.code}): ${event.reason || 'no reason'}\n`)
+})
+client.on('shardReconnecting', shardId => {
+  process.stderr.write(`discord channel: shard ${shardId} reconnecting\n`)
+})
+client.on('shardResume', (shardId, replayed) => {
+  process.stderr.write(`discord channel: shard ${shardId} resumed (replayed ${replayed} events)\n`)
+})
+client.on('shardReady', (shardId, unavailableGuilds) => {
+  const u = unavailableGuilds?.size ?? 0
+  process.stderr.write(`discord channel: shard ${shardId} ready${u ? ` (${u} unavailable guilds)` : ''}\n`)
+})
+
 // ────────────────────────────────────────────────────────────────────────────
 // Slash command registration — heintonny-fork addition.
 //
